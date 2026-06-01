@@ -429,9 +429,15 @@ def _json_content(value: Any) -> list[types.TextContent]:
 
 
 class Supervisor:
-    def __init__(self, config: SupervisorConfig, config_path: str = "") -> None:
+    def __init__(
+        self,
+        config: SupervisorConfig,
+        config_path: str = "",
+        auth_token: str | None = None,
+    ) -> None:
         self.config = config
         self.config_path = config_path
+        self.auth_token = auth_token
         self.manager = ProcessManager(config)
         self.upstreams: dict[str, UpstreamMCP] = {
             name: UpstreamMCP(name, spec, config.log_buffer)
@@ -651,5 +657,4 @@ class Supervisor:
             Mount("/mcp", app=mcp_handler),
         ]
         app = Starlette(routes=routes, lifespan=lifespan)
-        token = self.config.auth.token if self.config.auth else None
-        return TokenAuthMiddleware(app, token)  # type: ignore[return-value]
+        return TokenAuthMiddleware(app, self.auth_token)  # type: ignore[return-value]

@@ -28,7 +28,6 @@ def test_load_config_minimal(tmp_path: Path):
     cfg_file = tmp_path / ".supervisor.json"
     cfg_file.write_text(json.dumps({
         "bind": "127.0.0.1:1234",
-        "auth": {"token": "${TOK}"},
         "mcp_servers": {
             "x": {"command": "true"}
         },
@@ -38,7 +37,6 @@ def test_load_config_minimal(tmp_path: Path):
     }))
     cfg = load_config(cfg_file, env={"TOK": "abc"})
     assert cfg.bind == "127.0.0.1:1234"
-    assert cfg.auth and cfg.auth.token == "abc"
     assert cfg.host_port == ("127.0.0.1", 1234)
     assert cfg.mcp_servers["x"].autostart is True  # default for mcp_servers
     assert cfg.mcp_servers["x"].restart_policy.mode == "never"  # pydantic default

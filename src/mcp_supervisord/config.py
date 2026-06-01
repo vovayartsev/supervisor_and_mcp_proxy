@@ -36,10 +36,6 @@ class RestartPolicy(BaseModel):
         return v
 
 
-class AuthConfig(BaseModel):
-    token: str
-
-
 class McpServerSpec(BaseModel):
     namespace: str = ""
     command: str
@@ -61,7 +57,6 @@ class NamedToolSpec(BaseModel):
 
 class SupervisorConfig(BaseModel):
     bind: str = "0.0.0.0:9121"
-    auth: AuthConfig | None = None
     log_buffer: int = 1000
     shutdown_grace_seconds: float = 10.0
     mcp_servers: dict[str, McpServerSpec] = Field(default_factory=dict)

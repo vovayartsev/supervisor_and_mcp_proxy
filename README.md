@@ -26,13 +26,13 @@ CLI flags:
 
 ### `.env`
 
-Secrets are loaded from a `.env` file next to your config (and from the current working directory) before the config is parsed. Create one with:
+The auth token is read directly from a `.env` file next to your config (and from the current working directory). It is **not** part of `.supervisor.json`. Create one with:
 
 ```sh
 DEVCONTAINER_TOKEN=<my-super-token>
 ```
 
-The token is then referenced from `.supervisor.json` via `${DEVCONTAINER_TOKEN}` (see schema below). Startup fails with a clear error if `auth` is configured but the variable is missing/empty.
+Startup fails with a clear error if `DEVCONTAINER_TOKEN` is missing or empty.
 
 ---
 
@@ -41,7 +41,6 @@ The token is then referenced from `.supervisor.json` via `${DEVCONTAINER_TOKEN}`
 ```json
 {
   "bind": "0.0.0.0:9121",
-  "auth": { "token": "${DEVCONTAINER_TOKEN}" },
   "log_buffer": 1000,
   "shutdown_grace_seconds": 10,
 
@@ -76,7 +75,7 @@ The token is then referenced from `.supervisor.json` via `${DEVCONTAINER_TOKEN}`
 ```
 
 - `${VAR}` placeholders expand from environment at load time. Missing → empty string.
-- `auth` is optional; omit to disable token gate.
+- Auth token comes from `.env` (`DEVCONTAINER_TOKEN`), not from the config file.
 - `command` for `mcp_servers` / `named_tools` may be a bare argv0 (`true`) or a full shell-quoted command. When `args` is provided, `command` is taken literally; when `args` is empty, `command` is `shlex.split`.
 - `restart_policy.mode` ∈ `never` | `on-failure` | `always`.
 
@@ -144,7 +143,7 @@ Each `mcp_servers.<ns>` upstream exports its own tools under prefix `<ns>__<orig
 
 ### Auth
 
-If `auth.token` is set, every request to `/mcp*` must present **one** of:
+Every request to `/mcp*` must present **one** of:
 
 - `?token=<value>` query parameter, or
 - `Authorization: Bearer <value>` header.
