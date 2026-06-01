@@ -85,16 +85,25 @@ class UpstreamMCP:
             return name[len(pfx):]
         return None
 
-    async def start(self) -> None:
+    async def start(self, ready_timeout: float = 120.0) -> None:
         if self._task and not self._task.done():
             return
         self._stop_requested = False
         self._ready = asyncio.Event()
         self._task = asyncio.create_task(self._run(), name=f"upstream:{self.name}")
         try:
-            await asyncio.wait_for(self._ready.wait(), timeout=30)
+            await asyncio.wait_for(self._ready.wait(), timeout=ready_timeout)
         except asyncio.TimeoutError:
             pass
+
+    async def wait_ready(self, timeout: float) -> bool:
+        if self.state == "running" and self.tools:
+            return True
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=timeout)
+            return self.state == "running"
+        except asyncio.TimeoutError:
+            return False
 
     async def stop(self) -> None:
         self._stop_requested = True

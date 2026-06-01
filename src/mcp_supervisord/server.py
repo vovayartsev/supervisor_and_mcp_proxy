@@ -245,6 +245,20 @@ class Supervisor:
 
         @server.list_tools()
         async def _list_tools() -> list[types.Tool]:
+            # Wait briefly for upstreams still warming up so the client doesn't
+            # cache an incomplete tool list. Streamable HTTP stateless mode
+            # cannot push notifications/tools/list_changed afterwards.
+            import asyncio as _asyncio
+            pending = [
+                up for up in self.upstreams.values()
+                if up.spec.autostart and (up.state in ("starting",) or not up.tools)
+                and up.state != "backoff"
+            ]
+            if pending:
+                await _asyncio.gather(
+                    *(up.wait_ready(15.0) for up in pending),
+                    return_exceptions=True,
+                )
             tools = list(SUPERVISOR_TOOLS)
             for up in self.upstreams.values():
                 for t in up.tools:
