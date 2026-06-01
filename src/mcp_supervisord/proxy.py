@@ -85,16 +85,19 @@ class UpstreamMCP:
             return name[len(pfx):]
         return None
 
-    async def start(self, ready_timeout: float = 120.0) -> None:
+    async def start(self, ready_timeout: float | None = None) -> None:
+        """Spawn the upstream task. Does NOT block on readiness by default —
+        callers that need ready can pass a timeout or use wait_ready()."""
         if self._task and not self._task.done():
             return
         self._stop_requested = False
         self._ready = asyncio.Event()
         self._task = asyncio.create_task(self._run(), name=f"upstream:{self.name}")
-        try:
-            await asyncio.wait_for(self._ready.wait(), timeout=ready_timeout)
-        except asyncio.TimeoutError:
-            pass
+        if ready_timeout is not None:
+            try:
+                await asyncio.wait_for(self._ready.wait(), timeout=ready_timeout)
+            except asyncio.TimeoutError:
+                pass
 
     async def wait_ready(self, timeout: float) -> bool:
         if self.state == "running" and self.tools:
