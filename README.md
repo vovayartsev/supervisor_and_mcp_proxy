@@ -87,6 +87,11 @@ All exposed at `POST /mcp` (Streamable HTTP, MCP 2025‑06 spec).
 | `bash` | `cmd: str, timeout=30, cwd?, env={}` | `{exit_code, stdout, stderr, duration}` or `{status:"timeout", pid, recent_logs}` |
 | `wait` | `pid: int, timeout=60` | `{exit_code, duration}` or `{status:"timeout"}` |
 | `kill` | `pid: int, signal="TERM"` | `{killed: bool}` |
+| `start_interactive` | `cmd: str, cwd?, env={}, cols=120, rows=30` | `{session_id, pid}` — spawns under a PTY so Claude can talk over stdio |
+| `interactive_send` | `session_id, input, add_newline=true, wait_for?, wait_timeout=5, n=50` | snapshot `{lines, partial, matched, exit_code?, ...}` |
+| `interactive_read` | `session_id, n=50, wait_for?, wait_timeout=0` | snapshot incl. `partial` (so unterminated prompts like `Password:` are visible) |
+| `interactive_close` | `session_id, signal="TERM", grace=5` | `{closed, exit_code}` |
+| `interactive_list` | — | `[{session_id, pid, cmd, alive, exit_code}, ...]` |
 
 Each `mcp_servers.<ns>` upstream exports its own tools under prefix `<ns>__<orig>` (empty namespace = no prefix). Calls to a proxied tool while its upstream is not `running` return `{"error": "upstream <name> not available, state=<state>"}`.
 

@@ -107,6 +107,80 @@ SUPERVISOR_TOOLS: list[types.Tool] = [
         },
     ),
     types.Tool(
+        name="start_interactive",
+        description=(
+            "Spawn a process attached to a PTY so Claude can talk to it over stdio "
+            "(prompts, REPLs, ssh, etc.). Returns {session_id, pid}."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string"},
+                "cwd": {"type": ["string", "null"]},
+                "env": {"type": "object", "default": {}},
+                "cols": {"type": "integer", "default": 120},
+                "rows": {"type": "integer", "default": 30},
+            },
+            "required": ["cmd"],
+        },
+    ),
+    types.Tool(
+        name="interactive_send",
+        description=(
+            "Write input to a PTY session. add_newline appends \\n (default true). "
+            "If wait_for (regex) is set, blocks up to wait_timeout sec until output matches "
+            "or process exits. Returns recent output, optional match, exit_code if exited."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "input": {"type": "string"},
+                "add_newline": {"type": "boolean", "default": True},
+                "wait_for": {"type": ["string", "null"]},
+                "wait_timeout": {"type": "number", "default": 5},
+                "n": {"type": "integer", "default": 50},
+            },
+            "required": ["session_id", "input"],
+        },
+    ),
+    types.Tool(
+        name="interactive_read",
+        description=(
+            "Read tail output from a PTY session including the current partial "
+            "(unterminated) line — needed to see prompts like 'Password:'. "
+            "If wait_for is set, blocks up to wait_timeout."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "n": {"type": "integer", "default": 50},
+                "wait_for": {"type": ["string", "null"]},
+                "wait_timeout": {"type": "number", "default": 0},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    types.Tool(
+        name="interactive_close",
+        description="Terminate a PTY session. Sends signal (default TERM), then KILL after grace.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "signal": {"type": "string", "default": "TERM"},
+                "grace": {"type": "number", "default": 5},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    types.Tool(
+        name="interactive_list",
+        description="List active and recently exited PTY sessions.",
+        inputSchema={"type": "object", "properties": {}},
+    ),
+    types.Tool(
         name="restart_supervisor",
         description="Gracefully stop all managed processes, reload .supervisor.json from disk, restart with new config.",
         inputSchema={"type": "object", "properties": {}},
@@ -242,6 +316,54 @@ class Supervisor:
                 return await self.manager.wait(int(args["pid"]), float(args.get("timeout", 60)))
             if name == "kill":
                 return await self.manager.kill(int(args["pid"]), args.get("signal", "TERM"))
+            if name == "start_interactive":
+                sess = await self.manager.interactive.start(
+                    cmd=args["cmd"],
+                    cwd=args.get("cwd"),
+                    env=args.get("env") or {},
+                    cols=int(args.get("cols", 120)),
+                    rows=int(args.get("rows", 30)),
+                )
+                return {"session_id": sess.sid, "pid": sess.pid}
+            if name == "interactive_send":
+                import re as _re
+                sess = self.manager.interactive.get(args["session_id"])
+                sess.write(args["input"], add_newline=bool(args.get("add_newline", True)))
+                wf = args.get("wait_for")
+                matched = None
+                if wf:
+                    pat = _re.compile(wf, _re.MULTILINE)
+                    matched = await sess.wait_for_pattern(
+                        pat, float(args.get("wait_timeout", 5))
+                    )
+                else:
+                    await sess.wait_for_output(float(args.get("wait_timeout", 5)) or 0.05)
+                snap = sess.snapshot(int(args.get("n", 50)))
+                snap["matched"] = matched
+                return snap
+            if name == "interactive_read":
+                import re as _re
+                sess = self.manager.interactive.get(args["session_id"])
+                wf = args.get("wait_for")
+                matched = None
+                wait_t = float(args.get("wait_timeout", 0))
+                if wf and wait_t > 0:
+                    pat = _re.compile(wf, _re.MULTILINE)
+                    matched = await sess.wait_for_pattern(pat, wait_t)
+                elif wait_t > 0:
+                    await sess.wait_for_output(wait_t)
+                snap = sess.snapshot(int(args.get("n", 50)))
+                snap["matched"] = matched
+                return snap
+            if name == "interactive_close":
+                sess = self.manager.interactive.get(args["session_id"])
+                rc = await sess.close(
+                    sig=args.get("signal", "TERM"),
+                    grace=float(args.get("grace", 5)),
+                )
+                return {"closed": True, "exit_code": rc}
+            if name == "interactive_list":
+                return self.manager.interactive.list()
             if name == "restart_supervisor":
                 return await self.reload()
         except KeyError as e:

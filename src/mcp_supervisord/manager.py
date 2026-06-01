@@ -8,6 +8,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 
 from .config import NamedToolSpec, RestartPolicy, SupervisorConfig
+from .interactive import InteractiveRegistry
 from .logbuf import RingBuffer, pump_stream
 from .process import ManagedProcess, _iso_now
 
@@ -30,6 +31,7 @@ class ProcessManager:
         self.config = config
         self.named: dict[str, ManagedProcess] = {}
         self.bash_pids: OrderedDict[int, BashTracked] = OrderedDict()
+        self.interactive = InteractiveRegistry(config.log_buffer)
         self._init_named()
 
     def _init_named(self) -> None:
@@ -194,3 +196,4 @@ class ProcessManager:
                     t.proc.terminate()
                 except ProcessLookupError:
                     pass
+        await self.interactive.shutdown_all()
