@@ -16,6 +16,7 @@ dependencies = [
   "starlette>=0.37",
   "pydantic>=2.6",
   "anyio>=4.4",
+  "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

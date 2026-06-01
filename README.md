@@ -24,6 +24,16 @@ CLI flags:
 | `--host HOST` | override `bind` host |
 | `--port PORT` | override `bind` port |
 
+### `.env`
+
+Secrets are loaded from a `.env` file next to your config (and from the current working directory) before the config is parsed. Create one with:
+
+```sh
+DEVCONTAINER_TOKEN=<my-super-token>
+```
+
+The token is then referenced from `.supervisor.json` via `${DEVCONTAINER_TOKEN}` (see schema below). Startup fails with a clear error if `auth` is configured but the variable is missing/empty.
+
 ---
 
 ## `.supervisor.json` schema
@@ -31,7 +41,7 @@ CLI flags:
 ```json
 {
   "bind": "0.0.0.0:9121",
-  "auth": { "token": "..." },
+  "auth": { "token": "${DEVCONTAINER_TOKEN}" },
   "log_buffer": 1000,
   "shutdown_grace_seconds": 10,
 
