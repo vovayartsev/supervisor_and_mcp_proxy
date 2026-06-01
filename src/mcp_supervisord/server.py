@@ -20,170 +20,404 @@ from .manager import ProcessManager
 from .proxy import UpstreamMCP
 
 
+SERVER_INSTRUCTIONS = (
+    "Supervisor + MCP proxy. Three kinds of subprocesses:\n"
+    "  1. `named_tools` — long-lived processes declared in .supervisor.json. "
+    "Lifecycle: stopped → starting → running → (stopped|crashed|backoff). "
+    "On respawn the prior log buffer is preserved as `previous_log` "
+    "(read with `logs target=<name> previous=true`, kubectl `-p` analogy). "
+    "Manage via `start`/`stop`/`status`/`logs`.\n"
+    "  2. `mcp_servers` — stdio MCP upstreams declared in .supervisor.json. "
+    "Same lifecycle. Their tools are exposed here as `<namespace>__<orig>` "
+    "(empty namespace = bare original name; collisions across namespaces are caller's problem). "
+    "Calling a proxied tool whose upstream is not `running` returns "
+    '`{\"error\": \"upstream <name> not available, state=<state>\"}`. '
+    "Inspect with `status`/`logs`; restart by editing config and calling `restart_supervisor`.\n"
+    "  3. Ad-hoc `bash` commands — fire-and-wait shell with timeout fallback. "
+    "On timeout the process KEEPS RUNNING under a tracked pid; resume with `wait` or terminate with `kill`. "
+    "Tracked pids LRU-evicted after 100 entries.\n"
+    "Plus PTY-backed `start_interactive` sessions for REPLs/prompts (ssh, psql, etc.) "
+    "driven via `interactive_send`/`interactive_read`/`interactive_close`/`interactive_list`.\n"
+    "Log line shape: `{time, stream: 'stdout'|'stderr', message, truncated?}`. "
+    "Times are ISO-8601 UTC. Durations are seconds (float). All timeouts are seconds."
+)
+
+
 SUPERVISOR_TOOLS: list[types.Tool] = [
     types.Tool(
         name="start",
-        description="Start a named tool (managed process).",
+        description=(
+            "Start a named tool (long-lived managed process declared in .supervisor.json under `named_tools`). "
+            "Idempotent: if already running, returns `{pid, state:'running', error:'already running'}` without respawning. "
+            "Returns on success: `{pid:int, state:'running'|'starting'|'crashed'}`. "
+            "Blocks until the first spawn attempt completes (success or crash). "
+            "Side effect: starts a supervisor task that respawns per the tool's restart_policy "
+            "(states: stopped→starting→running, then crashed/backoff on failure). "
+            "Tail output with `logs target=<tool>`. Stop with `stop`."
+        ),
         inputSchema={
             "type": "object",
-            "properties": {"tool": {"type": "string"}},
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": "Name of the named_tool from .supervisor.json (NOT an mcp_server or bash pid). Unknown name → `{error: \"unknown tool '<name>'\"}`.",
+                },
+            },
             "required": ["tool"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="stop",
-        description="Stop a named tool. signal default TERM.",
+        description=(
+            "Stop a named tool. Sends `signal` (default SIGTERM), waits `shutdown_grace_seconds` from config, "
+            "then SIGKILLs if still alive. Also cancels the supervisor/restart task so the tool stays down "
+            "until `start` is called again. Returns `{stopped:true, last_exit_code:int|null}` on success, "
+            "or `{stopped:false, last_exit_code}` if the tool was already stopped. "
+            "Does NOT apply to bash pids — use `kill` for those — or to mcp_servers (restart_supervisor only)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "tool": {"type": "string"},
-                "signal": {"type": "string", "default": "TERM"},
+                "tool": {
+                    "type": "string",
+                    "description": "Name of the named_tool to stop.",
+                },
+                "signal": {
+                    "type": "string",
+                    "default": "TERM",
+                    "description": "Signal name without the SIG prefix (e.g. 'TERM', 'INT', 'HUP', 'KILL'). Unknown name falls back to SIGTERM.",
+                },
             },
             "required": ["tool"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="status",
-        description="Status of one tool or all (mcp_servers + named_tools).",
+        description=(
+            "Inspect supervised processes. With no `tool`: returns a dict keyed by name covering BOTH "
+            "`mcp_servers` (proxied upstreams) and `named_tools`. With `tool` set: returns just that entry. "
+            "Each entry: `{kind:'mcp_server'|'named_tool', state, pid, started_at, uptime_seconds, "
+            "restart_count, last_exit_code, last_exit_at}` plus `tools_proxied:int` for mcp_servers. "
+            "States: 'stopped' | 'starting' | 'running' | 'crashed' | 'backoff' (backoff = exceeded "
+            "restart_policy.max_restarts in window_seconds; will not auto-recover). "
+            "Unknown name → `{error: \"unknown tool '<name>'\"}`. "
+            "Does NOT list bash pids — those live only as logs targets."
+        ),
         inputSchema={
             "type": "object",
-            "properties": {"tool": {"type": ["string", "null"]}},
+            "properties": {
+                "tool": {
+                    "type": ["string", "null"],
+                    "description": "Optional: name of a single named_tool or mcp_server. Omit/null to get all.",
+                },
+            },
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="logs",
         description=(
-            "Tail recent log lines for target (tool name or bash pid). "
-            "Buffer holds only the current run; pass previous=true (like `kubectl logs -p`) "
-            "to read the prior run's buffer (named tools / mcp_servers only)."
+            "Tail recent log lines from a process's ring buffer. "
+            "Returns `list[{time, stream, message, truncated?}]` (oldest→newest). "
+            "Empty list if the target has no buffer yet (e.g. never-started named tool). "
+            "Buffer capacity comes from config.log_buffer (per-process ring). "
+            "`previous=true` reads the buffer captured at the LAST respawn boundary "
+            "(`kubectl logs -p` analogy) — only valid for named_tools and mcp_servers, "
+            "NOT for bash pids (raises). On a named_tool / mcp_server's first run, previous buffer is empty."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "target": {"type": ["string", "integer"]},
-                "n": {"type": "integer", "default": 50},
-                "stream": {"type": "string", "enum": ["all", "stdout", "stderr"], "default": "all"},
-                "previous": {"type": "boolean", "default": False},
+                "target": {
+                    "type": ["string", "integer"],
+                    "description": (
+                        "String: name of a named_tool or mcp_server. "
+                        "Integer: a bash pid returned by `bash` (also matches a named_tool's current pid). "
+                        "Unknown target → error."
+                    ),
+                },
+                "n": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Max lines to return (tail). Use 0 to return all buffered lines.",
+                },
+                "stream": {
+                    "type": "string",
+                    "enum": ["all", "stdout", "stderr"],
+                    "default": "all",
+                    "description": "Filter by stream. 'all' interleaves both in original capture order.",
+                },
+                "previous": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Read the prior run's buffer (named_tool / mcp_server only). Errors for bash pids.",
+                },
             },
             "required": ["target"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="bash",
-        description="Run a shell command. On timeout returns pid + recent_logs; process keeps running.",
+        description=(
+            "Run an ad-hoc shell command (via /bin/sh -c). "
+            "On normal exit returns `{exit_code:int, stdout:str, stderr:str, duration:float}` (duration in seconds). "
+            "On `timeout` returns `{status:'timeout', pid:int, recent_logs:list[LogLine]}` "
+            "and the process KEEPS RUNNING — use `wait` to await exit or `kill` to terminate. "
+            "Tracked pid is retained in an LRU (capacity 100) so `wait`/`kill`/`logs target=<pid>` work afterwards. "
+            "stdin is /dev/null. Stdout/stderr are also captured to a per-pid ring buffer accessible via `logs`."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "cmd": {"type": "string"},
-                "timeout": {"type": "integer", "default": 30},
-                "cwd": {"type": ["string", "null"]},
-                "env": {"type": "object", "default": {}},
+                "cmd": {
+                    "type": "string",
+                    "description": "Shell command string. Passed to /bin/sh -c, so shell features (pipes, redirects, &&) work.",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "Seconds to wait for the process to finish before returning a timeout sentinel. Process is NOT killed on timeout.",
+                },
+                "cwd": {
+                    "type": ["string", "null"],
+                    "description": "Working directory. Null/omitted = supervisor's cwd.",
+                },
+                "env": {
+                    "type": "object",
+                    "default": {},
+                    "additionalProperties": {"type": "string"},
+                    "description": "Extra env vars merged on top of the supervisor's process environment.",
+                },
             },
             "required": ["cmd"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="wait",
-        description="Wait for a previously spawned bash pid to exit.",
+        description=(
+            "Wait for a tracked bash pid (from a prior `bash` timeout) to exit. "
+            "Returns `{exit_code:int, duration:float}` on exit, or `{status:'timeout'}` if still running "
+            "after `timeout` seconds (the process keeps running; call `wait` again or `kill`). "
+            "Unknown/evicted pid → error. Does NOT apply to named_tool or interactive session pids."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "pid": {"type": "integer"},
-                "timeout": {"type": "integer", "default": 60},
+                "pid": {
+                    "type": "integer",
+                    "description": "Bash pid returned by `bash` (must still be in the tracked LRU).",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "default": 60,
+                    "description": "Max seconds to block waiting for exit.",
+                },
             },
             "required": ["pid"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="kill",
-        description="Send a signal to a tracked bash pid.",
+        description=(
+            "Send a signal to a tracked bash pid. Returns `{killed:true}` if the signal was delivered, "
+            "`{killed:false}` if the process had already exited or vanished. "
+            "Non-blocking — to confirm the process is gone, follow with `wait`. "
+            "For named_tool processes use `stop` instead; for PTY sessions use `interactive_close`."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "pid": {"type": "integer"},
-                "signal": {"type": "string", "default": "TERM"},
+                "pid": {
+                    "type": "integer",
+                    "description": "Bash pid returned by `bash` (must still be in the tracked LRU).",
+                },
+                "signal": {
+                    "type": "string",
+                    "default": "TERM",
+                    "description": "Signal name without SIG prefix (e.g. 'TERM','INT','KILL','HUP'). Unknown name falls back to SIGTERM.",
+                },
             },
             "required": ["pid"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="start_interactive",
         description=(
-            "Spawn a process attached to a PTY so Claude can talk to it over stdio "
-            "(prompts, REPLs, ssh, etc.). Returns {session_id, pid}."
+            "Spawn a process attached to a fresh PTY so the caller can drive it interactively "
+            "(prompts, REPLs, ssh, psql, fish, etc.). Returns `{session_id:str, pid:int}`. "
+            "Drive the session with `interactive_send` / `interactive_read`; terminate with `interactive_close`. "
+            "Sessions are tracked in an LRU (capacity 50); dead sessions are evicted lazily. "
+            "Output is captured to a per-session ring buffer; unterminated trailing output is preserved "
+            "as `partial` so prompts like `Password:` (no newline) are visible via `interactive_read`."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "cmd": {"type": "string"},
-                "cwd": {"type": ["string", "null"]},
-                "env": {"type": "object", "default": {}},
-                "cols": {"type": "integer", "default": 120},
-                "rows": {"type": "integer", "default": 30},
+                "cmd": {
+                    "type": "string",
+                    "description": "Command line, parsed with shlex (NOT a shell — use 'sh -c \"...\"' if you need pipes).",
+                },
+                "cwd": {
+                    "type": ["string", "null"],
+                    "description": "Working directory. Null/omitted = supervisor's cwd.",
+                },
+                "env": {
+                    "type": "object",
+                    "default": {},
+                    "additionalProperties": {"type": "string"},
+                    "description": "Extra env vars merged onto the supervisor's environment. TERM defaults to 'xterm-256color'.",
+                },
+                "cols": {
+                    "type": "integer",
+                    "default": 120,
+                    "description": "PTY width in columns.",
+                },
+                "rows": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "PTY height in rows.",
+                },
             },
             "required": ["cmd"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="interactive_send",
         description=(
-            "Write input to a PTY session. add_newline appends \\n (default true). "
-            "If wait_for (regex) is set, blocks up to wait_timeout sec until output matches "
-            "or process exits. Returns recent output, optional match, exit_code if exited."
+            "Write input to a PTY session and optionally wait for output. "
+            "Returns a session snapshot: "
+            "`{session_id, pid, cmd, alive:bool, exit_code:int|null, uptime_seconds, "
+            "lines:list[LogLine], partial:str, cols, rows, matched:str|null}`. "
+            "`partial` is the current unterminated line (e.g. a prompt awaiting input). "
+            "`matched` is set when `wait_for` matched; null otherwise. "
+            "If `wait_for` is provided, blocks up to `wait_timeout` seconds until the regex matches buffered output OR the process exits."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"},
-                "input": {"type": "string"},
-                "add_newline": {"type": "boolean", "default": True},
-                "wait_for": {"type": ["string", "null"]},
-                "wait_timeout": {"type": "number", "default": 5},
-                "n": {"type": "integer", "default": 50},
+                "session_id": {
+                    "type": "string",
+                    "description": "Session id from `start_interactive` (e.g. 'int-3'). Unknown id → error.",
+                },
+                "input": {
+                    "type": "string",
+                    "description": "Bytes to write to the PTY master. Newline is NOT appended unless `add_newline` is true.",
+                },
+                "add_newline": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Append '\\n' to `input` before writing — set false to send raw bytes (control chars, partial lines).",
+                },
+                "wait_for": {
+                    "type": ["string", "null"],
+                    "description": "Optional Python regex (re.MULTILINE) to wait for in output. Null = don't wait for a pattern.",
+                },
+                "wait_timeout": {
+                    "type": "number",
+                    "default": 5,
+                    "description": "Seconds to block waiting for `wait_for` or for any new output (falls back to 0.05s min if 0).",
+                },
+                "n": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Tail size for the returned `lines` array.",
+                },
             },
             "required": ["session_id", "input"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="interactive_read",
         description=(
-            "Read tail output from a PTY session including the current partial "
-            "(unterminated) line — needed to see prompts like 'Password:'. "
-            "If wait_for is set, blocks up to wait_timeout."
+            "Read tail output from a PTY session WITHOUT writing. "
+            "Returns the same snapshot shape as `interactive_send` (incl. `partial` for unterminated trailing output — "
+            "essential for prompts like 'Password:' that emit no newline). "
+            "If `wait_for` and `wait_timeout > 0`, blocks until the regex matches or timeout expires; "
+            "if only `wait_timeout > 0`, blocks until any new output arrives or timeout expires; "
+            "otherwise returns the current buffer immediately."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"},
-                "n": {"type": "integer", "default": 50},
-                "wait_for": {"type": ["string", "null"]},
-                "wait_timeout": {"type": "number", "default": 0},
+                "session_id": {
+                    "type": "string",
+                    "description": "Session id from `start_interactive`.",
+                },
+                "n": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Tail size for the returned `lines` array.",
+                },
+                "wait_for": {
+                    "type": ["string", "null"],
+                    "description": "Optional Python regex (re.MULTILINE) to wait for. Requires `wait_timeout > 0` to take effect.",
+                },
+                "wait_timeout": {
+                    "type": "number",
+                    "default": 0,
+                    "description": "Seconds to block. 0 = return immediately with current buffer.",
+                },
             },
             "required": ["session_id"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="interactive_close",
-        description="Terminate a PTY session. Sends signal (default TERM), then KILL after grace.",
+        description=(
+            "Terminate a PTY session. Sends `signal` to the child's process group, waits up to `grace` seconds, "
+            "then SIGKILLs if still alive. Returns `{closed:true, exit_code:int|null}`. "
+            "Idempotent: closing an already-exited session returns its captured exit code."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"},
-                "signal": {"type": "string", "default": "TERM"},
-                "grace": {"type": "number", "default": 5},
+                "session_id": {
+                    "type": "string",
+                    "description": "Session id from `start_interactive`.",
+                },
+                "signal": {
+                    "type": "string",
+                    "default": "TERM",
+                    "description": "Signal name without SIG prefix. Sent to the session's process group (setsid'd child).",
+                },
+                "grace": {
+                    "type": "number",
+                    "default": 5,
+                    "description": "Seconds to wait for graceful exit before escalating to SIGKILL.",
+                },
             },
             "required": ["session_id"],
+            "additionalProperties": False,
         },
     ),
     types.Tool(
         name="interactive_list",
-        description="List active and recently exited PTY sessions.",
-        inputSchema={"type": "object", "properties": {}},
+        description=(
+            "List all PTY sessions tracked in the registry (active and recently exited; LRU cap 50). "
+            "Returns `list[{session_id, pid, cmd, alive, exit_code, uptime_seconds, cols, rows}]`. "
+            "Use `interactive_read` to fetch buffered output for a specific session."
+        ),
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
     ),
     types.Tool(
         name="restart_supervisor",
-        description="Gracefully stop all managed processes, reload .supervisor.json from disk, restart with new config.",
-        inputSchema={"type": "object", "properties": {}},
+        description=(
+            "Gracefully shut down ALL supervised processes (named_tools, mcp_server upstreams, bash, interactive sessions), "
+            "reload .supervisor.json from disk, and re-autostart everything declared with `autostart:true`. "
+            "Returns `{reloaded:true, config:<path>}` on success or `{error:'config_path not set; cannot reload'}` "
+            "if the server was started without a config path. "
+            "Use this after editing .supervisor.json. Note: all bash pids and interactive session ids become invalid."
+        ),
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
     ),
 ]
 
@@ -241,7 +475,10 @@ class Supervisor:
     # --- MCP server wiring ---
 
     def _build_server(self) -> Server:
-        server: Server = Server("supervisor-and-mcp-proxy")
+        server: Server = Server(
+            "supervisor-and-mcp-proxy",
+            instructions=SERVER_INSTRUCTIONS,
+        )
 
         @server.list_tools()
         async def _list_tools() -> list[types.Tool]:
